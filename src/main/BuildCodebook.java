@@ -1,7 +1,11 @@
 import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
 import java.util.StringTokenizer;
 
 import org.apache.commons.cli.CommandLine;
@@ -14,6 +18,7 @@ import org.apache.commons.cli.ParseException;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
 import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.IntWritable;
@@ -29,8 +34,8 @@ import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
 import org.apache.log4j.Logger;
 import org.apache.mahout.clustering.Cluster;
-import org.apache.mahout.clustering.canopy.CanopyDriver;
-import org.apache.mahout.clustering.conversion.meanshift.InputDriver;
+import org.apache.mahout.clustering.classify.WeightedVectorWritable;
+import org.apache.mahout.clustering.conversion.InputDriver;
 import org.apache.mahout.clustering.kmeans.KMeansDriver;
 import org.apache.mahout.clustering.kmeans.RandomSeedGenerator;
 import org.apache.mahout.common.distance.DistanceMeasure;
@@ -43,47 +48,6 @@ import cern.colt.Arrays;
 
 public class BuildCodebook extends Configured implements Tool {
 	private static final Logger LOG = Logger.getLogger(BuildCodebook.class);
-
-	// Mapper: emits (token, 1) for every word occurrence.
-	private static class MyMapper extends
-			Mapper<LongWritable, Text, Text, IntWritable> {
-
-		// Reuse objects to save overhead of object creation.
-		private final static IntWritable ONE = new IntWritable(1);
-		private final static Text WORD = new Text();
-
-		@Override
-		public void map(LongWritable key, Text value, Context context)
-				throws IOException, InterruptedException {
-			String line = ((Text) value).toString();
-			StringTokenizer itr = new StringTokenizer(line);
-			while (itr.hasMoreTokens()) {
-				WORD.set(itr.nextToken());
-				context.write(WORD, ONE);
-			}
-		}
-	}
-
-	// Reducer: sums up all the counts.
-	private static class MyReducer extends
-			Reducer<Text, IntWritable, Text, IntWritable> {
-
-		// Reuse objects.
-		private final static IntWritable SUM = new IntWritable();
-
-		@Override
-		public void reduce(Text key, Iterable<IntWritable> values,
-				Context context) throws IOException, InterruptedException {
-			// Sum up values.
-			Iterator<IntWritable> iter = values.iterator();
-			int sum = 0;
-			while (iter.hasNext()) {
-				sum += iter.next().get();
-			}
-			SUM.set(sum);
-			context.write(key, SUM);
-		}
-	}
 
 	public void TransformVectorsToSequence(Configuration conf,
 			String inputPath, String outputPath) throws IOException {
@@ -119,10 +83,9 @@ public class BuildCodebook extends Configured implements Tool {
 	}
 
 	public void KMeansByMahout(Configuration conf, String inputPath,
-			String outputPath) throws Exception {
+			String outputPath, int K) throws Exception {
 		
 		DistanceMeasure measure = new EuclideanDistanceMeasure();
-		int K = 1024;
 
 		// Read from text input data and transform it to Sequence File
 		//TransformVectorsToSequence(conf, inputPath, sequencePath);
@@ -132,7 +95,7 @@ public class BuildCodebook extends Configured implements Tool {
 		FileSystem.get(conf).delete(sequence, true);
 		
 	    LOG.info("Preparing Input");
-		InputDriver.runJob(input, sequence);
+		InputDriver.runJob(input, sequence, "org.apache.mahout.math.RandomAccessSparseVector");
 
 		Path output = new Path(outputPath);
 		FileSystem.get(conf).delete(output, true);
@@ -153,7 +116,16 @@ public class BuildCodebook extends Configured implements Tool {
 	    // run ClusterDumper
 	    ClusterDumper clusterDumper = new ClusterDumper(new Path(output, "clusters-*-final"), new Path(output,
 	        "clusteredPoints"));
-	    clusterDumper.printClusters(null);
+//	    clusterDumper.printClusters(null);
+	    
+	    String textoutput = "HumanReadableClusters";
+	    FSDataOutputStream fsout = FileSystem.get(conf).create(new Path(output, textoutput));
+	    BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(fsout));
+	    Map<Integer, List<WeightedVectorWritable>> clusterMap = clusterDumper.getClusterIdToPoints();
+	    for (Map.Entry<Integer, List<WeightedVectorWritable>> entry : clusterMap.entrySet()) {
+	    	writer.write(entry.toString() + "\n");
+	    }
+	    writer.close();
 	}
 
 	/**
@@ -164,6 +136,7 @@ public class BuildCodebook extends Configured implements Tool {
 
 	private static final String INPUT = "input";
 	private static final String OUTPUT = "output";
+	private static final String NUM_CLUSTERS = "K";
 
 	/**
 	 * Runs this tool.
@@ -176,6 +149,8 @@ public class BuildCodebook extends Configured implements Tool {
 				.withDescription("input path").create(INPUT));
 		options.addOption(OptionBuilder.withArgName("path").hasArg()
 				.withDescription("output path").create(OUTPUT));
+		options.addOption(OptionBuilder.withArgName("num").hasArg()
+				.withDescription("number of clusters").create(NUM_CLUSTERS));
 
 		CommandLine cmdline;
 		CommandLineParser parser = new GnuParser();
@@ -199,12 +174,15 @@ public class BuildCodebook extends Configured implements Tool {
 
 		String inputPath = cmdline.getOptionValue(INPUT);
 		String outputPath = cmdline.getOptionValue(OUTPUT);
+	    int numClusters = cmdline.hasOption(NUM_CLUSTERS) ?
+	            Integer.parseInt(cmdline.getOptionValue(NUM_CLUSTERS)) : 1024;
 
 		LOG.info("Tool: " + BuildCodebook.class.getSimpleName());
 
 		Configuration conf = getConf();
 
-		KMeansByMahout(conf, inputPath, outputPath);
+		// Kmeans using mahout
+		KMeansByMahout(conf, inputPath, outputPath, numClusters);
 
 		long startTime = System.currentTimeMillis();
 		LOG.info("Job Finished in " + (System.currentTimeMillis() - startTime)
